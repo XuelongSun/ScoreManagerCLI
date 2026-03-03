@@ -5,7 +5,7 @@ from colorama import Fore, Style, init
 from prettytable import PrettyTable
 
 from manager import StudentManager
-from objs import SCORE_TYPE, Student
+from objs import SCORE_TYPE, Student, Course
 import warnings
 
 init(autoreset=True)
@@ -24,9 +24,8 @@ class StudentManagerCIL(cmd.Cmd):
     intro = "Welcome to student ScoreManger V0.2@sxl, GZHU"
     def __init__(self, course_name='course1'):
         super().__init__()
-        self.manager = StudentManager()
-        self.manager.course.name = course_name
-        self.prompt = f"Students@{course_name}>>"
+        self.manager = StudentManager(Course(name=course_name))
+        self.prompt = f"Students@{self.manager.course.name}>>"
     
     def show_students(self, students):
         if isinstance(students, Iterable):

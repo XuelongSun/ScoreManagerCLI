@@ -91,12 +91,16 @@ class StudentManager:
                 f.write(log)
         
         ## add working directory for course
-        with open(f"working_directories.json", "r", encoding='utf-8') as f:
-            wd_data = json.load(f)
-            if self.course.name in wd_data.keys():
-                wd_data[self.course.name] = self.working_dir
-            else:
-                wd_data.update({self.course.name: self.working_dir})
+        if os.path.exists(r"working_directories.json"):
+            with open(f"working_directories.json", "r", encoding='utf-8') as f:
+                wd_data = json.load(f)
+                if self.course.name in wd_data.keys():
+                    wd_data[self.course.name] = self.working_dir
+                else:
+                    wd_data.update({self.course.name: self.working_dir})
+        else:
+            wd_data = {}
+            wd_data[self.course.name] = self.working_dir
         
         with open(f"working_directories.json", 'w', encoding='utf-8') as f:
             json.dump(wd_data, f, ensure_ascii=False, indent=2)
