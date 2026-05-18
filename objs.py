@@ -84,7 +84,7 @@ class Course:
     def find_students_by_names(self, names):
         if isinstance(names, str):
             for s in self.students.values():
-                if s.N == names:
+                if s.name == names:
                     return s
         elif isinstance(names, Iterable):
             return_s = []

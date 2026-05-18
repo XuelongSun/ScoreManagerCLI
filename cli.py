@@ -194,7 +194,6 @@ class StudentManagerCIL(cmd.Cmd):
             for log in self.manager.logger.log[-20:]:
                 print(log.strip())
     
-    
     def do_tops(self, args):
         '''
         Show top N students by score type.
@@ -237,7 +236,61 @@ class StudentManagerCIL(cmd.Cmd):
         tab.field_names = ['RANK', 'No.', 'Name', 'ID', 'Score']
         tab.add_rows([[i, s.N, s.name, s.id, score] for i, (s,score) in enumerate(ranked)])
         print(tab)
+    
+    def do_add(self, args):
+        '''
+        Add a student manually with/without given No.
+        Usage: add Name ID [-n No.]
+        Examples:
+            add John with ID=1001: add john 1001
+            add Tom with ID=1002 and No.=12: add Tom 1002 -n 12 (Note that No. of students Numbered after 12 will +1)
+        '''
+        if not args:
+            print("Usage: add Name ID [-n No.]")
+            return
         
+        parts = args.split()
+        if len(parts) == 2:
+            self.manager.add_student(Student(parts[1], parts[0]))
+        elif len(parts) == 4 and '-n' in parts:
+            ns = parts[parts.index("-n")+1]
+            if ns.isdigit():
+                self.manager.add_student(Student(parts[1], parts[0]), with_no=True, no=int(ns))
+            else:
+                print_info(2, "The provided No. is not a digit")
+        else:
+            print_info(2, "Invalid command!")
+            return
+
+
+    def do_rm(self, args):
+        '''
+        remove a student manually by No. or name. Note that the No. of student after removed student will -1.
+        Usage: rm [-n No.][-N name]
+        Examples:
+            remove John: rm -N john
+            remove student with No.=2: rm -n 2
+        '''
+        if not args:
+            print("Usage: rm [-n No.][-N name]")
+            return
+        
+        parts = args.split()
+        
+        if "-n" in parts:
+            ns = parts[parts.index("-n")+1]
+            student = self.manager.course.find_students_by_nos(int(ns))
+        if "-N" in parts:
+            ns = parts[parts.index("-N")+1]
+            student = self.manager.course.find_students_by_names(ns)
+        if student:
+            user_input = input(f"{student.name}{[student.id]} will be removed, yes(Y)/no(N)?")
+            if user_input == "yes" or user_input == "Y":
+                self.manager.remove_student(student)
+            elif user_input == "no" or user_input == "N":
+                return
+        
+                
     def do_save(self, args):
         '''
         Save current data to file.

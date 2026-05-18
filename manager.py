@@ -32,13 +32,30 @@ class StudentManager:
             with open(os.path.join(self.working_dir, f"{self.course.name}_activity_log.txt"), 'r', encoding='utf-8') as f:
                 self.logger.log = f.readlines()
         
-    def add_student(self, student:Student, log=True):
+    def add_student(self, student:Student, log=True, with_no=False, no=0):
         if student.id in self.course.students:
             return False, "Student already exists"
         self.course.students[student.id] = student
+        
+        if with_no:
+            for s in self.course.students.values():
+                if s.N >= no:
+                    s.N += 1
+            self.course.students[student.id].N = no
+            self.course.students = dict(sorted(self.course.students.items(), key=lambda x: x[1].N))
         if log:
             self.logger.add(f"Added {student.name}[{student.id}]")
         return True, f"Student {student.name} added successfully"
+    
+    def remove_student(self, student: Student):
+        if student.id not in self.course.students:
+            return False, "Student not found"
+        self.course.students.pop(student.id)
+        for s in self.course.students.values():
+            if s.N > student.N:
+                s.N -= 1
+        self.logger.add(f"Removed {student.name}[{student.id}].")
+        return True, f"Student {student.name} removed successfully"
     
     def import_student(self, fullpath):
         directory, filename = os.path.split(fullpath)
