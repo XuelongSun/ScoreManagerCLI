@@ -55,9 +55,15 @@ class StudentManagerCIL(cmd.Cmd):
             print_info(2, "Usage: import <filename>")
             return
         try:
-            self.manager.import_student(args)
-            print_info(0, f"Imported {len(self.manager.course.students)} students from {args}.")
+            self.manager.push_undo(f"import {args}")
+            f, msg = self.manager.import_student(args)
+            if f:
+                print_info(0, f"Imported {len(self.manager.course.students)} students from {args}.")
+            else:
+                self.manager.rollback_undo()
+                print_info(2, msg)
         except Exception as e:
+            self.manager.rollback_undo()
             print_info(2, f"Error importing file: {e}")
     
     def do_show(self, args):
@@ -108,9 +114,11 @@ class StudentManagerCIL(cmd.Cmd):
             s = self.manager.course.find_students_by_nos(int(args[0]))
             if not s:
                 return 
-            s.add_score(args[1], int(args[2]))
-            print(f"{s.N}-{s.name}[{s.id}]:"+ Fore.GREEN + Style.BRIGHT + f" +{int(args[2])}" + Style.RESET_ALL + f"({SCORE_TYPE[args[1]]})!")
-            self.manager.logger.add(f"Record: {s.N}-{s.name}[{s.id}]: +{args[2]}({SCORE_TYPE[args[1]]})")
+            score = int(args[2])
+            self.manager.push_undo(f"record +{score}({SCORE_TYPE[args[1]]}) for {s.N}-{s.name}[{s.id}]")
+            s.add_score(args[1], score)
+            print(f"{s.N}-{s.name}[{s.id}]:"+ Fore.GREEN + Style.BRIGHT + f" +{score}" + Style.RESET_ALL + f"({SCORE_TYPE[args[1]]})!")
+            self.manager.logger.add(f"Record: {s.N}-{s.name}[{s.id}]: +{score}({SCORE_TYPE[args[1]]})")
             
     def do_brd(self, args):
         '''
@@ -132,10 +140,13 @@ class StudentManagerCIL(cmd.Cmd):
             students = self.manager.course.find_students_by_nos([int(n) for n in args[0].split(',')])
             exclusion = '-e' in args
             score = int(args[2])
+            self.manager.push_undo(f"batch record +{score}({SCORE_TYPE[args[1]]})")
             f, msg = self.manager.course.add_scores(students, args[1], score, exclusion)
             print_info(f, msg)
             if not f:
                 self.manager.logger.add(f"Batch record: +{score}({SCORE_TYPE[args[1]]}) for students{' excluding:' if exclusion else ':'} {[s.name for s in students]}")
+            else:
+                self.manager.rollback_undo()
     
     def do_find(self, args):
         '''
@@ -251,11 +262,19 @@ class StudentManagerCIL(cmd.Cmd):
         
         parts = args.split()
         if len(parts) == 2:
-            self.manager.add_student(Student(parts[1], parts[0]))
+            self.manager.push_undo(f"add {parts[0]}[{parts[1]}]")
+            f, msg = self.manager.add_student(Student(parts[1], parts[0]))
+            if not f:
+                self.manager.rollback_undo()
+                print_info(2, msg)
         elif len(parts) == 4 and '-n' in parts:
             ns = parts[parts.index("-n")+1]
             if ns.isdigit():
-                self.manager.add_student(Student(parts[1], parts[0]), with_no=True, no=int(ns))
+                self.manager.push_undo(f"add {parts[0]}[{parts[1]}] with No.={ns}")
+                f, msg = self.manager.add_student(Student(parts[1], parts[0]), with_no=True, no=int(ns))
+                if not f:
+                    self.manager.rollback_undo()
+                    print_info(2, msg)
             else:
                 print_info(2, "The provided No. is not a digit")
         else:
@@ -286,11 +305,20 @@ class StudentManagerCIL(cmd.Cmd):
         if student:
             user_input = input(f"{student.name}{[student.id]} will be removed, yes(Y)/no(N)?")
             if user_input == "yes" or user_input == "Y":
+                self.manager.push_undo(f"remove {student.N}-{student.name}[{student.id}]")
                 self.manager.remove_student(student)
             elif user_input == "no" or user_input == "N":
                 return
         
                 
+    def do_undo(self, args):
+        '''
+        Undo the last successful data-changing operation.
+        Usage: undo
+        '''
+        f, msg = self.manager.undo()
+        print_info(f, msg)
+
     def do_save(self, args):
         '''
         Save current data to file.

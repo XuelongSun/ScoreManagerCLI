@@ -1,5 +1,6 @@
 import datetime
 import csv
+import copy
 import os
 import pandas as pd
 from objs import Student, Course, Logger, SCORE_TYPE
@@ -11,7 +12,50 @@ class StudentManager:
         self.course = class_obj if class_obj else Course()
         self.logger = Logger()
         self.working_dir = ''
+        self.undo_stack = []
         self.load_data()
+
+    def push_undo(self, description):
+        self.undo_stack.append({
+            "description": description,
+            "course": copy.deepcopy(self.course),
+            "logger": copy.deepcopy(self.logger),
+            "log_length": len(self.logger.log),
+            "working_dir": self.working_dir,
+            "student_next_no": Student.N,
+        })
+
+    def discard_undo(self):
+        if self.undo_stack:
+            self.undo_stack.pop()
+
+    def _restore_data(self, snapshot):
+        self.course = snapshot["course"]
+        self.working_dir = snapshot["working_dir"]
+        Student.N = snapshot["student_next_no"]
+
+    def rollback_undo(self):
+        if not self.undo_stack:
+            return
+
+        snapshot = self.undo_stack.pop()
+        self._restore_data(snapshot)
+        self.logger = snapshot["logger"]
+
+    def undo(self):
+        if not self.undo_stack:
+            return 1, "Nothing to undo"
+
+        snapshot = self.undo_stack.pop()
+        description = snapshot["description"]
+        undo_logs = [
+            log for log in self.logger.log[snapshot["log_length"]:]
+            if "] Undo:" in log
+        ]
+        self._restore_data(snapshot)
+        self.logger.log = snapshot["logger"].log + undo_logs
+        self.logger.add(f"Undo: {description}")
+        return 0, f"Undid: {description}"
         
     def load_data(self):
         with open(f"working_directories.json", "r", encoding='utf-8') as f:
