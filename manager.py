@@ -19,6 +19,20 @@ class StudentManager:
         self.undo_stack = []
         self.load_data()
 
+    def theory_score_path(self):
+        return os.path.join(self.working_dir, f"{self.course.name}_student_score.json")
+
+    def read_file_field_schema(self):
+        path = self.theory_score_path()
+        if not os.path.exists(path):
+            return None, path, f"Score file not found: {path}"
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        schema = data.get("field_schema")
+        if not schema:
+            return None, path, "field_schema not found in score file"
+        return schema, path, ""
+
     def push_undo(self, description, scope="theory"):
         self.undo_stack.append({
             "description": description,
@@ -86,16 +100,20 @@ class StudentManager:
         
         legacy_lab_records = []
         lab_file = os.path.join(self.working_dir, f"{self.course.name}_lab_score.json")
-        if os.path.exists(os.path.join(self.working_dir, f"{self.course.name}_student_score.json")):
-            with open(os.path.join(self.working_dir, f"{self.course.name}_student_score.json"), 'r', encoding='utf-8') as f:
+        if os.path.exists(self.theory_score_path()):
+            with open(self.theory_score_path(), 'r', encoding='utf-8') as f:
                 student_data = json.load(f)
+                if "field_schema" in student_data:
+                    self.course.load_field_schema(student_data["field_schema"])
                 for student_id, data in student_data['students'].items():
                     student = Student(student_id, data['name'])
                     if "No." in data:
                         student.N = int(data["No."])
                         Student.N = max(Student.N, student.N + 1)
-                    for s_t in SCORE_TYPE.values():
-                        exec(f"student.{s_t} = data.get('{s_t}', [])")
+                    for s_t in self.course.all_primary_field_names():
+                        student.ensure_score_field(s_t)
+                        student.scores[s_t] = data.get(s_t, [])
+                        setattr(student, s_t, student.scores[s_t])
                     self.add_student(student)
                     if not os.path.exists(lab_file) and data.get('lab'):
                         legacy_lab_records.append((student_id, data['name'], data.get("No.", student.N), data['lab']))
@@ -129,6 +147,8 @@ class StudentManager:
     def add_student(self, student:Student, log=True, with_no=False, no=0):
         if student.id in self.course.students:
             return False, "Student already exists"
+        for field_name in self.course.all_primary_field_names():
+            student.ensure_score_field(field_name)
         self.course.students[student.id] = student
         
         if with_no:
@@ -213,6 +233,7 @@ class StudentManager:
 
         student_data = {
             'class_name':self.course.name,
+            'field_schema': self.course.export_field_schema(),
             'students': {}
         }
         for sid, s in self.course.students.items():
@@ -220,10 +241,9 @@ class StudentManager:
                 "name": s.name,
                 "No.":s.N,
             }
-            for s_t in SCORE_TYPE.values():
-                # exec(f"student_data['students'][sid].update({s_t," + f"s.{s_t}})")
-                exec(f"student_data['students'][sid]['{s_t}']=s.{s_t}")
-                # print(f"student_data['students'][sid]['{s_t}']=s.{s_t}")
+            for s_t in self.course.all_primary_field_names():
+                s.ensure_score_field(s_t)
+                student_data['students'][sid][s_t] = s.scores[s_t]
         
         with open(os.path.join(self.working_dir, f"{self.course.name}_student_score.json"), 'w', encoding='utf-8') as f:
             json.dump(student_data, f, ensure_ascii=False, indent=2)

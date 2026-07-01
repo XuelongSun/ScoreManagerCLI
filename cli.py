@@ -5,8 +5,7 @@ from colorama import Fore, Style, init
 from prettytable import PrettyTable
 
 from manager import StudentManager
-from objs import SCORE_TYPE, Student, Course, LabStudent
-import warnings
+from objs import Student, Course, LabStudent
 
 init(autoreset=True)
 
@@ -66,9 +65,213 @@ class StudentManagerCIL(cmd.Cmd):
             return False
         return True
 
-    def _format_score(self, score):
+    def _format_score(self, score, display_mode=None):
         score = float(score)
-        return int(score) if score.is_integer() else score
+        formatted = str(int(score)) if score.is_integer() else f"{score:.2f}".rstrip('0').rstrip('.')
+        if display_mode:
+            formatted += self.manager.course.display_mode_suffix(display_mode)
+        return formatted
+
+    def _format_score_with_extra(self, score, extra, mode):
+        formatted = self._format_score(score)
+        extra = float(extra)
+        if extra <= 1e-9:
+            return formatted
+        extra_text = self._format_score(extra)
+        if self.manager.course.normalize_display_mode(mode) == "percent":
+            extra_text += "%"
+        return f"{formatted}(+{extra_text})"
+
+    def _parse_extra_flag(self, parts):
+        return [part for part in parts if part != "--extra"], "--extra" in parts
+
+    def _parse_display_modes(self, parts):
+        remaining = []
+        global_mode = None
+        field_modes = {}
+        idx = 0
+        while idx < len(parts):
+            token = parts[idx]
+            if token in ["-m", "--mode", "--display"]:
+                if idx + 1 >= len(parts):
+                    return None, None, None, f"Please provide a display mode after {token}"
+                global_mode, field_modes, msg = self._merge_display_mode_spec(parts[idx + 1], global_mode, field_modes)
+                if msg:
+                    return None, None, None, msg
+                idx += 2
+                continue
+            if token.startswith("--display=") or token.startswith("--mode=") or token.startswith("-m="):
+                spec = token.split("=", 1)[1]
+                global_mode, field_modes, msg = self._merge_display_mode_spec(spec, global_mode, field_modes)
+                if msg:
+                    return None, None, None, msg
+                idx += 1
+                continue
+            remaining.append(token)
+            idx += 1
+        return remaining, global_mode, field_modes, None
+
+    def _merge_display_mode_spec(self, spec, global_mode, field_modes):
+        field_modes = field_modes.copy()
+        for item in [s.strip() for s in spec.split(',') if s.strip()]:
+            if "=" in item:
+                field, mode = item.split("=", 1)
+            elif ":" in item:
+                field, mode = item.split(":", 1)
+            else:
+                mode = self.manager.course.normalize_display_mode(item)
+                if not mode:
+                    return global_mode, field_modes, f"Unknown display mode: {item}"
+                global_mode = mode
+                continue
+            field = self.manager.course.normalize_field_name(field.strip())
+            if field not in self.manager.course.all_display_field_names():
+                return global_mode, field_modes, f"Unknown score field for display mode: {field}"
+            mode = self.manager.course.normalize_display_mode(mode.strip())
+            if not mode:
+                return global_mode, field_modes, f"Unknown display mode: {item}"
+            field_modes[field] = mode
+        return global_mode, field_modes, None
+
+    def _resolve_display_mode(self, field, global_mode=None, field_modes=None):
+        field = self.manager.course.normalize_field_name(field)
+        field_modes = field_modes or {}
+        return field_modes.get(field, global_mode or self.manager.course.default_display_mode(field))
+
+    def _field_header(self, field, mode):
+        return f"{field}{self.manager.course.display_mode_suffix(mode)}"
+
+    def _color(self, text, color_name, bright=False):
+        color = getattr(Fore, color_name, "")
+        style = getattr(Style, "BRIGHT", "") if bright else ""
+        reset = getattr(Style, "RESET_ALL", "")
+        return f"{style}{color}{text}{reset}"
+
+    def _schema_config_value(self, config, key, default=''):
+        if key == "max_score":
+            return config.get("max_score", config.get("max-score", default))
+        return config.get(key, default)
+
+    def _schema_primary_configs(self, schema):
+        primary_configs = schema.get("primary", [])
+        if isinstance(primary_configs, dict):
+            primary_configs = [
+                dict(config, name=name) if isinstance(config, dict) and "name" not in config else config
+                for name, config in primary_configs.items()
+            ]
+        return primary_configs
+
+    def _schema_secondary_configs(self, schema):
+        secondary_configs = schema.get("secondary", [])
+        if isinstance(secondary_configs, dict):
+            secondary_configs = [
+                dict(config, name=name) if isinstance(config, dict) and "name" not in config else config
+                for name, config in secondary_configs.items()
+            ]
+        return secondary_configs
+
+    def _schema_find_alias(self, schema, field_name, default=''):
+        for config in self._schema_secondary_configs(schema):
+            if self._schema_config_value(config, "name") == field_name:
+                return self._schema_config_value(config, "alias", default)
+        return default
+
+    def _schema_format_number(self, value):
+        if value == '' or value is None:
+            return ''
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return str(int(value)) if value.is_integer() else f"{value:.2f}".rstrip('0').rstrip('.')
+
+    def _print_schema_primary(self, config, indent, color_name):
+        name = self._schema_config_value(config, "name")
+        alias = self._schema_config_value(config, "alias", "-")
+        mode = self.manager.course._normalize_mode(self._schema_config_value(config, "mode", "points"))
+        max_score = self._schema_format_number(self._schema_config_value(config, "max_score"))
+        weight = self._schema_format_number(self._schema_config_value(config, "weight"))
+        label = self._color(f"{name}({alias})", color_name, bright=True)
+        print(f"{indent}- {label}: weight={weight}, max={max_score}, mode={mode}")
+
+    def _print_schema_tree(self, schema, source, path=None):
+        color_name = "CYAN" if source == "cache" else "MAGENTA"
+        title = "CACHE field_schema" if source == "cache" else "FILE field_schema"
+        print(self._color(title, color_name, bright=True))
+        if path:
+            print(self._color(f"path: {path}", color_name))
+
+        primary_configs = self._schema_primary_configs(schema)
+        usual_fields = [c for c in primary_configs if self._schema_config_value(c, "group") == "usual"]
+        exam_fields = [c for c in primary_configs if self._schema_config_value(c, "group") == "exam"]
+        usual_weight = sum(float(self._schema_config_value(c, "weight", 0) or 0) for c in usual_fields)
+        total_weight = sum(float(self._schema_config_value(c, "weight", 0) or 0) for c in primary_configs)
+        usual_alias = self._schema_find_alias(schema, "usual", "u")
+        total_alias = self._schema_find_alias(schema, "total", "t")
+
+        print(f"{self._color(f'total({total_alias})', color_name, bright=True)} weight={self._schema_format_number(total_weight)}")
+        print(f"  {self._color(f'usual({usual_alias})', color_name, bright=True)} weight={self._schema_format_number(usual_weight)}")
+        for config in usual_fields:
+            self._print_schema_primary(config, "    ", color_name)
+
+        exam_weight = sum(float(self._schema_config_value(c, "weight", 0) or 0) for c in exam_fields)
+        print(f"  {self._color('exam', color_name, bright=True)} weight={self._schema_format_number(exam_weight)}")
+        for config in exam_fields:
+            self._print_schema_primary(config, "    ", color_name)
+
+        other_fields = [
+            c for c in primary_configs
+            if self._schema_config_value(c, "group") not in ["usual", "exam"]
+        ]
+        if other_fields:
+            print(f"  {self._color('other group', color_name, bright=True)}")
+            for config in other_fields:
+                self._print_schema_primary(config, "    ", color_name)
+
+        print()
+
+    def _schema_rows(self, schema, source):
+        rows = []
+        primary_configs = self._schema_primary_configs(schema)
+        for config in primary_configs:
+            rows.append([
+                source,
+                "primary",
+                self._schema_config_value(config, "name"),
+                self._schema_config_value(config, "alias"),
+                self._schema_config_value(config, "max_score"),
+                self._schema_config_value(config, "mode"),
+                self._schema_config_value(config, "weight"),
+                self._schema_config_value(config, "group"),
+            ])
+        for config in self._schema_secondary_configs(schema):
+            rows.append([
+                source,
+                "secondary",
+                self._schema_config_value(config, "name"),
+                self._schema_config_value(config, "alias"),
+                "",
+                "",
+                "",
+                self._schema_config_value(config, "group"),
+            ])
+        return rows
+
+    def show_field_schema(self, scope="all"):
+        scope = scope or "all"
+        if scope not in ["all", "cache", "file"]:
+            print_info(2, "Usage: schema [cache|file|all]")
+            return
+
+        if scope in ["all", "cache"]:
+            self._print_schema_tree(self.manager.course.export_field_schema(), "cache")
+
+        if scope in ["all", "file"]:
+            file_schema, path, msg = self.manager.read_file_field_schema()
+            if file_schema:
+                self._print_schema_tree(file_schema, "file", path)
+            else:
+                print_info(1, msg)
 
     def _lab_label(self, exp_no):
         exp_no = str(exp_no)
@@ -86,25 +289,37 @@ class StudentManagerCIL(cmd.Cmd):
             print(help_text)
             print()
     
-    def show_students(self, students):
+    def show_students(self, students, global_mode=None, field_modes=None, show_extra=False):
         if isinstance(students, Iterable):
             tab = PrettyTable()
             tab.border = True
-            field_names = ['No.', 'Name', 'ID']
-            for k, v in SCORE_TYPE.items():
-                field_names.append(v)
-            field_names.append('Total')
-            tab.field_names = field_names
+            fields = self.manager.course.all_display_field_names()
+            field_modes_by_name = {
+                field: self._resolve_display_mode(field, global_mode, field_modes)
+                for field in fields
+            }
+            tab.field_names = ['No.', 'Name', 'ID'] + [
+                self._field_header(field, field_modes_by_name[field])
+                for field in fields
+            ]
             for s in students:
-                score = s.calculate_score()
-                tab.add_row([s.N, s.name, s.id] + list(score) + [sum(score)])
+                row = [s.N, s.name, s.id]
+                for field in fields:
+                    mode = field_modes_by_name[field]
+                    score = self.manager.course.display_field_score(s, field, mode)
+                    extra = self.manager.course.display_field_extra(s, field, mode) if show_extra else 0
+                    row.append(self._format_score_with_extra(score, extra, mode) if show_extra else self._format_score(score))
+                tab.add_row(row)
             print(tab)
         elif isinstance(students, Student):
-            score = students.calculate_score()
             print_score = f"{students.N}-{students.name}({students.id}): "
-            for i, (k, v) in enumerate(SCORE_TYPE.items()):
-                print_score += f"{v}:{score[i]}, "
-            print_score += (Fore.GREEN + f" Total: {sum(score)}")
+            for field in self.manager.course.all_display_field_names():
+                mode = self._resolve_display_mode(field, global_mode, field_modes)
+                score = self.manager.course.display_field_score(students, field, mode)
+                extra = self.manager.course.display_field_extra(students, field, mode) if show_extra else 0
+                display_score = self._format_score_with_extra(score, extra, mode) if show_extra else self._format_score(score)
+                print_score += f"{self._field_header(field, mode)}:{display_score}, "
+            print(print_score)
         else:
             return 2, f"Unknown Student {students}"
 
@@ -154,32 +369,51 @@ class StudentManagerCIL(cmd.Cmd):
         '''
         Show student scores by name(-N) or No.(-n), show all students with no parameter.
         Usage:
-            show [-N name1,name2,... | -n student_No1,student_No2,...]
+            show [-N name1,name2,... | -n student_No1,student_No2,...] [-m point|percent|field=mode,...] [--extra]
+            show field [cache|file|all]
         Examples:
             1.show all students' scores: show
             2.show students' score with No.=1,2,3: show -n 1,2,3
             3.show students' score with name=john: show -N john
+            4.show all scores as percent: show -m percent
+            5.show default modes but exam as points: show -m exam=point
+            6.show capped scores with extra-performance notes: show --extra
+            7.show field schema comparison: show field
         '''
         if not self._theory_enabled():
             return
-        if not args:
-            self.show_students(self.manager.course.students.values())
-            return
-        else:
-            parts = args.split()
-            if len(parts) != 2:
-                print_info(2, "Usage: show -N/-n <student_name>/<student_No>")
+        raw_parts = args.split() if args else []
+        if raw_parts and raw_parts[0] == "field":
+            if len(raw_parts) > 3 or (len(raw_parts) > 1 and raw_parts[1] != "schema" and len(raw_parts) > 2):
+                print_info(2, "Usage: show field [schema] [cache|file|all]")
                 return
-            
-            if parts[0] == '-N':
-                names = [n for n in parts[1].split(',')]
-                students = self.manager.course.find_students_by_names(names)
-                self.show_students(students)
-                
-            elif parts[0] == '-n':
-                nos = [int(s) for s in parts[1].split(',')]
-                students = self.manager.course.find_students_by_nos(nos)
-                self.show_students(students)
+            if len(raw_parts) > 1 and raw_parts[1] == "schema":
+                scope = raw_parts[2] if len(raw_parts) == 3 else "all"
+            else:
+                scope = raw_parts[1] if len(raw_parts) == 2 else "all"
+            self.show_field_schema(scope)
+            return
+        parts, global_mode, field_modes, msg = self._parse_display_modes(raw_parts) if args else ([], None, {}, None)
+        if msg:
+            print_info(2, msg)
+            return
+        parts, show_extra = self._parse_extra_flag(parts)
+        if not parts:
+            self.show_students(self.manager.course.students.values(), global_mode, field_modes, show_extra)
+            return
+        if len(parts) != 2:
+            print_info(2, "Usage: show [-N/-n <student_name>/<student_No>] [-m point|percent|field=mode,...] [--extra]")
+            return
+
+        if parts[0] == '-N':
+            names = [n for n in parts[1].split(',')]
+            students = self.manager.course.find_students_by_names(names)
+            self.show_students(students, global_mode, field_modes, show_extra)
+
+        elif parts[0] == '-n':
+            nos = [int(s) for s in parts[1].split(',')]
+            students = self.manager.course.find_students_by_nos(nos)
+            self.show_students(students, global_mode, field_modes, show_extra)
     
     def do_rd(self, args):
         '''
@@ -193,20 +427,21 @@ class StudentManagerCIL(cmd.Cmd):
             return
         args = args.split()
         if not len(args) == 3:
-            print(f"Usage: rd <student_No.> <type {list(SCORE_TYPE.keys())}> <score>")
+            print(f"Usage: rd <student_No.> <field> <score>")
             return
-        if args[1] not in SCORE_TYPE.keys():
-            print_info(2, f"Type must be one of {list(SCORE_TYPE.keys())}")
+        field_name = self.manager.course.normalize_field_name(args[1])
+        if field_name not in self.manager.course.primary_fields:
+            print_info(2, f"Field must be one of {self.manager.course.all_primary_field_names()}")
             return
         else:
             s = self.manager.course.find_students_by_nos(int(args[0]))
             if not s:
                 return 
-            score = int(args[2])
-            self.manager.push_undo(f"record +{score}({SCORE_TYPE[args[1]]}) for {s.N}-{s.name}[{s.id}]")
-            s.add_score(args[1], score)
-            print(f"{s.N}-{s.name}[{s.id}]:"+ Fore.GREEN + Style.BRIGHT + f" +{score}" + Style.RESET_ALL + f"({SCORE_TYPE[args[1]]})!")
-            self.manager.logger.add(f"Record: {s.N}-{s.name}[{s.id}]: +{score}({SCORE_TYPE[args[1]]})")
+            score = float(args[2])
+            self.manager.push_undo(f"record +{score}({field_name}) for {s.N}-{s.name}[{s.id}]")
+            s.add_score(field_name, score)
+            print(f"{s.N}-{s.name}[{s.id}]:"+ Fore.GREEN + Style.BRIGHT + f" +{self._format_score(score)}" + Style.RESET_ALL + f"({field_name})!")
+            self.manager.logger.add(f"Record: {s.N}-{s.name}[{s.id}]: +{self._format_score(score)}({field_name})")
             
     def do_brd(self, args):
         '''
@@ -221,20 +456,21 @@ class StudentManagerCIL(cmd.Cmd):
             return
         args = args.split()
         if not args:
-            print("Usage: brd <student_No1,student_No2,> <type[c/a/h/e]> <score> {-e}")
+            print("Usage: brd <student_No1,student_No2,> <field> <score> {-e}")
             return
-        if args[1] not in SCORE_TYPE.keys():
-            print(f"Type must be one of {list(SCORE_TYPE.keys())}")
+        field_name = self.manager.course.normalize_field_name(args[1])
+        if field_name not in self.manager.course.primary_fields:
+            print(f"Field must be one of {self.manager.course.all_primary_field_names()}")
             return
         else:
             students = self.manager.course.find_students_by_nos([int(n) for n in args[0].split(',')])
             exclusion = '-e' in args
-            score = int(args[2])
-            self.manager.push_undo(f"batch record +{score}({SCORE_TYPE[args[1]]})")
-            f, msg = self.manager.course.add_scores(students, args[1], score, exclusion)
+            score = float(args[2])
+            self.manager.push_undo(f"batch record +{score}({field_name})")
+            f, msg = self.manager.course.add_scores(students, field_name, score, exclusion)
             print_info(f, msg)
             if not f:
-                self.manager.logger.add(f"Batch record: +{score}({SCORE_TYPE[args[1]]}) for students{' excluding:' if exclusion else ':'} {[s.name for s in students]}")
+                self.manager.logger.add(f"Batch record: +{self._format_score(score)}({field_name}) for students{' excluding:' if exclusion else ':'} {[s.name for s in students]}")
             else:
                 self.manager.rollback_undo()
     
@@ -260,17 +496,21 @@ class StudentManagerCIL(cmd.Cmd):
         '''
         Show the log of recorded student scores.
         Usage:
-            log [-n student_No1,student_No2,...] [-c] [-a] [-h] [-e] [all]
+            log [-n student_No1,student_No2,...] [-c] [-a] [-h] [-e] [all] [-m point|percent|field=mode,...]
         Examples:
             1.show the last 20 (batched) logs for the whole class: log
             2.show class participation logs of students with No.=1,2,3: log -n 1,2,3 -c
             3.show all types of logs of students with No.=1,2,3: log -n 1,2,3 all
             4.the same as 3: log -n 1,2,3
+            5.show score records in percent display mode: log -n 1 -m percent
         '''
         if not self._theory_enabled():
             return
         if args:
-            parts = args.split()
+            parts, global_mode, field_modes, msg = self._parse_display_modes(args.split())
+            if msg:
+                print_info(2, msg)
+                return
             if '-n' in parts:
                 ns = parts[parts.index("-n")+1]
                 students = self.manager.course.find_students_by_nos([int(n) for n in ns.split(',')])
@@ -279,21 +519,29 @@ class StudentManagerCIL(cmd.Cmd):
             
             data = []
             if students:
+                requested_fields = [
+                    self.manager.course.normalize_field_name(t.lstrip('-'))
+                    for t in parts
+                    if t not in ["-n", "all"]
+                ]
+                selected_fields = [
+                    field for field in self.manager.course.all_primary_field_names()
+                    if field in requested_fields
+                ]
+                if not selected_fields:
+                    selected_fields = self.manager.course.all_primary_field_names()
                 for s in students:
-                    for k, v in SCORE_TYPE.items():
-                        if k in parts:
-                            tmp = eval(f"s.{v}")
-                            for d, sc in tmp:
-                                data.append((s.N, s.name, s.id, v, d, sc))
-                    if not any([t in parts for t in SCORE_TYPE.keys()]):
-                        for k, v in SCORE_TYPE.items():
-                            tmp = eval(f"s.{v}")
-                            for d, sc in tmp:
-                                data.append((s.N, s.name, s.id, v, d, sc))
+                    for field in selected_fields:
+                        s.ensure_score_field(field)
+                        for d, sc in s.scores[field]:
+                            data.append((s.N, s.name, s.id, field, d, sc))
                 data.sort(key=lambda x: (x[4], x[3]))
                 tab = PrettyTable()
                 tab.field_names = ['Date', 'No.', 'Name', 'ID', 'Score', 'Type']
-                tab.add_rows([[x[4],x[0],x[1],x[2],"+" + str(x[-1]),x[3]] for x in data])
+                for d_no, name, sid, field, date, score in data:
+                    mode = self._resolve_display_mode(field, global_mode, field_modes)
+                    display_score = self.manager.course.display_record_score(field, score, mode)
+                    tab.add_row([date, d_no, name, sid, "+" + self._format_score(display_score, mode), field])
                 print(tab)
         else:
             for log in self.manager.logger.log[-20:]:
@@ -302,7 +550,7 @@ class StudentManagerCIL(cmd.Cmd):
     def do_tops(self, args):
         '''
         Show top N students by score type.
-        Usage: tops [-n N] [-t type]
+        Usage: tops [-n N] [-t type] [-m point|percent|field=mode,...] [--extra]
         type: t/u/e/h/a/c
         Examples:
             1.show top 5 students by total score: tops
@@ -310,12 +558,18 @@ class StudentManagerCIL(cmd.Cmd):
             3.show top 10 students by exam score: tops -n 10 -t e
             4.show top 5 students by homework score: tops -t h
             5.show last 5 students by homework score: tops -n -5 -t h
+            6.show exam contribution points: tops -t e -m point
+            7.show extra-performance notes: tops --extra
         '''
         if not self._theory_enabled():
             return
         n = 5
-        rank_by = "t"
-        parts = args.split()
+        rank_by = "total"
+        parts, global_mode, field_modes, msg = self._parse_display_modes(args.split()) if args else ([], None, {}, None)
+        if msg:
+            print_info(2, msg)
+            return
+        parts, show_extra = self._parse_extra_flag(parts)
         if "-n" in parts:
             try:
                 if parts[parts.index("-n")+1].startswith('-'):
@@ -328,21 +582,52 @@ class StudentManagerCIL(cmd.Cmd):
         
         if "-t" in parts:
             try:
-                rank_by = parts[parts.index("-t")+1]
+                rank_by = self.manager.course.normalize_field_name(parts[parts.index("-t")+1])
             except:
-                print_info(2, f"please provide a valid type after -t: {list(SCORE_TYPE.keys()) + ['t','u']}")
+                print_info(2, f"please provide a valid type after -t: {self.manager.course.all_display_field_names()}")
                 return
         
-        ranked = self.manager.course.get_top_students(n, rank_by)
-        tmp_dict = SCORE_TYPE.copy()
-        tmp_dict['t'] = 'total'
-        title = f"Ranked by {tmp_dict[rank_by]} score"
+        display_mode = self._resolve_display_mode(rank_by, global_mode, field_modes)
+        ranked = self.manager.course.get_top_students(n, rank_by, display_mode)
+        if not ranked:
+            print_info(2, f"Unknown rank field: {rank_by}")
+            return
+        title = f"Ranked by {rank_by} score"
         title += f'(TOP-{n}): ' if n > 0 else f'(LAST-{abs(n)}): '
         tab = PrettyTable()
         tab.title = title
-        tab.field_names = ['RANK', 'No.', 'Name', 'ID', 'Score']
-        tab.add_rows([[i, s.N, s.name, s.id, score] for i, (s,score) in enumerate(ranked)])
+        tab.field_names = ['RANK', 'No.', 'Name', 'ID', self._field_header('Score', display_mode)]
+        for i, (s, score) in enumerate(ranked):
+            extra = self.manager.course.display_field_extra(s, rank_by, display_mode) if show_extra else 0
+            display_score = self._format_score_with_extra(score, extra, display_mode) if show_extra else self._format_score(score)
+            tab.add_row([i, s.N, s.name, s.id, display_score])
         print(tab)
+
+    def do_schema(self, args):
+        '''
+        Show current field schema from memory cache and/or the JSON score file.
+        Usage: schema [cache|file|all]
+        '''
+        if not self._theory_enabled():
+            return
+        parts = args.split()
+        if len(parts) > 1:
+            print_info(2, "Usage: schema [cache|file|all]")
+            return
+        self.show_field_schema(parts[0] if parts else "all")
+
+    def do_field(self, args):
+        '''
+        Show field schema.
+        Usage: field schema [cache|file|all]
+        '''
+        if not self._theory_enabled():
+            return
+        parts = args.split()
+        if not parts or parts[0] != "schema" or len(parts) > 2:
+            print_info(2, "Usage: field schema [cache|file|all]")
+            return
+        self.show_field_schema(parts[1] if len(parts) == 2 else "all")
     
     def do_add(self, args):
         '''
@@ -359,6 +644,10 @@ class StudentManagerCIL(cmd.Cmd):
             return
         
         parts = args.split()
+        if parts[0] == "field":
+            print_info(1, "Field schema is fixed. Use change field <class_p|attendance|homework|exam> to modify weights or scoring mode.")
+            return
+
         if len(parts) == 2:
             self.manager.push_undo(f"add {parts[0]}[{parts[1]}]")
             f, msg = self.manager.add_student(Student(parts[1], parts[0]))
@@ -410,6 +699,79 @@ class StudentManagerCIL(cmd.Cmd):
             elif user_input == "no" or user_input == "N":
                 return
         
+    def add_field(self, parts):
+        '''
+        Deprecated. The score schema is fixed; use change field instead.
+        '''
+        print_info(1, "Field schema is fixed. Use change field <class_p|attendance|homework|exam> to modify weights or scoring mode.")
+
+    def do_change(self, args):
+        '''
+        Change a score field.
+        Usage:
+            change field <field_name> [-n new_name] [-m max_score] [-s points|percent] [-w weight] [-a alias]
+        Notes:
+            - Use -a none to clear an alias.
+            - "change filed ..." is also accepted as a typo-tolerant form.
+        '''
+        if not self._theory_enabled():
+            return
+        parts = args.split()
+        if len(parts) < 2 or parts[0] not in ["field", "filed"]:
+            print_info(2, "Usage: change field <field_name> [-n new_name] [-m max_score] [-s points|percent] [-w weight] [-a alias]")
+            return
+
+        field_name = parts[1]
+        idx = 2
+        new_name = None
+        max_score = None
+        mode = None
+        weight = None
+        fields = None
+        alias = None
+        alias_changed = False
+
+        while idx < len(parts):
+            option = parts[idx]
+            if idx + 1 >= len(parts):
+                print_info(2, f"Please provide a value after {option}")
+                return
+            value = parts[idx + 1]
+            if option == "-n":
+                new_name = value
+            elif option == "-m":
+                max_score = value
+            elif option == "-s":
+                mode = value
+            elif option == "-w":
+                weight = value
+            elif option == "-f":
+                fields = [field for field in value.split(',') if field]
+            elif option == "-a":
+                alias_changed = True
+                alias = None if value in ["none", "None", "null", "-"] else value
+            else:
+                print_info(2, f"Unknown option for change field: {option}")
+                return
+            idx += 2
+
+        self.manager.push_undo(f"change field {field_name}")
+        f, msg = self.manager.course.change_field(
+            field_name,
+            new_name=new_name,
+            max_score=max_score,
+            mode=mode,
+            weight=weight,
+            fields=fields,
+            alias=alias,
+            alias_changed=alias_changed,
+        )
+        if not f:
+            self.manager.logger.add(f"Changed field {field_name}")
+        else:
+            self.manager.rollback_undo()
+        print_info(f, msg)
+
                 
     def do_lab(self, args):
         '''
