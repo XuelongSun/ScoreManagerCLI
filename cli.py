@@ -1,5 +1,7 @@
 import cmd
+import ast
 import os
+import re
 from collections.abc import Iterable
 from colorama import Fore, Style, init
 from prettytable import PrettyTable
@@ -84,6 +86,17 @@ class StudentManagerCIL(cmd.Cmd):
 
     def _parse_extra_flag(self, parts):
         return [part for part in parts if part != "--extra"], "--extra" in parts
+
+    def _parse_date_flag(self, parts):
+        if "-d" not in parts:
+            return parts, None, None
+        idx = parts.index("-d")
+        if idx + 1 >= len(parts):
+            return None, None, "Please provide a date after -d, e.g. show -d 2026-07-01"
+        date = parts[idx + 1]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+            return None, None, "Date must be in YYYY-MM-DD format"
+        return parts[:idx] + parts[idx + 2:], date, None
 
     def _parse_display_modes(self, parts):
         remaining = []
@@ -323,6 +336,108 @@ class StudentManagerCIL(cmd.Cmd):
         else:
             return 2, f"Unknown Student {students}"
 
+    def _score_as_field_percent(self, field, score):
+        field = self.manager.course.normalize_field_name(field)
+        config = self.manager.course.primary_fields.get(field)
+        if not config or not config["max_score"]:
+            return 0
+        return float(score) / config["max_score"] * 100
+
+    def _students_matching_names(self, names):
+        name_set = set(names)
+        return [
+            student
+            for student in self.manager.course.students.values()
+            if student.name in name_set
+        ]
+
+    def _parse_log_name_list(self, raw_names):
+        try:
+            names = ast.literal_eval(raw_names)
+            if isinstance(names, list):
+                return [str(name) for name in names]
+        except (SyntaxError, ValueError):
+            pass
+        return [
+            name.strip().strip("'\"")
+            for name in raw_names.strip("[]").split(",")
+            if name.strip()
+        ]
+
+    def _daily_log_records(self, target_date):
+        single_re = re.compile(
+            r"^Record: (?P<no>\d+)-(?P<name>.+)\[(?P<sid>[^\]]+)\]: "
+            r"\+(?P<score>[-+]?\d+(?:\.\d+)?)(?:\((?P<field>[^)]+)\))"
+        )
+        batch_re = re.compile(
+            r"^Batch record: \+(?P<score>[-+]?\d+(?:\.\d+)?)(?:\((?P<field>[^)]+)\)) "
+            r"for students(?P<excluding> excluding)?: (?P<names>\[.*\])$"
+        )
+
+        for line in self.manager.logger.log:
+            log_match = re.match(r"^\[(?P<date>\d{4}-\d{2}-\d{2}) [^\]]+\] (?P<message>.*)$", line.strip())
+            if not log_match or log_match.group("date") != target_date:
+                continue
+            message = log_match.group("message")
+
+            single_match = single_re.match(message)
+            if single_match:
+                field = self.manager.course.normalize_field_name(single_match.group("field"))
+                if field not in self.manager.course.primary_fields:
+                    continue
+                student = self.manager.course.students.get(single_match.group("sid"))
+                if not student:
+                    student = self.manager.course.find_students_by_nos(int(single_match.group("no")))
+                if student:
+                    yield student, field, float(single_match.group("score"))
+                continue
+
+            batch_match = batch_re.match(message)
+            if batch_match:
+                field = self.manager.course.normalize_field_name(batch_match.group("field"))
+                if field not in self.manager.course.primary_fields:
+                    continue
+                names = self._parse_log_name_list(batch_match.group("names"))
+                listed_students = self._students_matching_names(names)
+                listed_ids = {student.id for student in listed_students}
+                if batch_match.group("excluding"):
+                    students = [
+                        student for student in self.manager.course.students.values()
+                        if student.id not in listed_ids
+                    ]
+                else:
+                    students = listed_students
+                for student in students:
+                    yield student, field, float(batch_match.group("score"))
+
+    def show_daily_scores(self, target_date, parts):
+        if not parts:
+            students = list(self.manager.course.students.values())
+        elif len(parts) == 2 and parts[0] == "-n":
+            students = self.manager.course.find_students_by_nos([int(n) for n in parts[1].split(',')])
+        elif len(parts) == 2 and parts[0] == "-N":
+            students = self.manager.course.find_students_by_names([n for n in parts[1].split(',')])
+        else:
+            print_info(2, "Usage: show -d YYYY-MM-DD [-n No1,No2 | -N name1,name2]")
+            return
+
+        fields = self.manager.course.all_primary_field_names()
+        daily_scores = {
+            student.id: {field: 0 for field in fields}
+            for student in self.manager.course.students.values()
+        }
+        for student, field, score in self._daily_log_records(target_date):
+            if student.id in daily_scores:
+                daily_scores[student.id][field] += self._score_as_field_percent(field, score)
+
+        tab = PrettyTable()
+        tab.title = f"Daily scores on {target_date}"
+        tab.field_names = ['No.', 'Name', 'ID'] + [f"{field}(%)" for field in fields]
+        for student in sorted(students, key=lambda s: s.N):
+            scores = [self._format_score(daily_scores[student.id][field]) for field in fields]
+            tab.add_row([student.N, student.name, student.id] + scores)
+        print(tab)
+
     def show_lab_students(self, students):
         if isinstance(students, Iterable):
             tab = PrettyTable()
@@ -370,6 +485,7 @@ class StudentManagerCIL(cmd.Cmd):
         Show student scores by name(-N) or No.(-n), show all students with no parameter.
         Usage:
             show [-N name1,name2,... | -n student_No1,student_No2,...] [-m point|percent|field=mode,...] [--extra]
+            show -d YYYY-MM-DD [-N name1,name2,... | -n student_No1,student_No2,...]
             show field [cache|file|all]
         Examples:
             1.show all students' scores: show
@@ -379,6 +495,7 @@ class StudentManagerCIL(cmd.Cmd):
             5.show default modes but exam as points: show -m exam=point
             6.show capped scores with extra-performance notes: show --extra
             7.show field schema comparison: show field
+            8.show daily equivalent scores: show -d 2026-07-01
         '''
         if not self._theory_enabled():
             return
@@ -392,6 +509,13 @@ class StudentManagerCIL(cmd.Cmd):
             else:
                 scope = raw_parts[1] if len(raw_parts) == 2 else "all"
             self.show_field_schema(scope)
+            return
+        raw_parts, target_date, date_msg = self._parse_date_flag(raw_parts)
+        if date_msg:
+            print_info(2, date_msg)
+            return
+        if target_date:
+            self.show_daily_scores(target_date, raw_parts)
             return
         parts, global_mode, field_modes, msg = self._parse_display_modes(raw_parts) if args else ([], None, {}, None)
         if msg:

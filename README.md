@@ -52,6 +52,7 @@ show
 show -m percent
 show -m points,exam=percent
 show --extra
+show -d 2026-07-01
 log -n 1 -m percent
 tops -t exam -m point
 tops --extra
@@ -59,6 +60,7 @@ tops --extra
 
 Displayed scores are marked as `(pt)` for points that count into the final score, and `(%)` for percentage style scores.
 When `--extra` is used, primary fields that exceed the field cap show an extra-performance note, such as `20(+3)` or `100(+15%)`.
+`show -d YYYY-MM-DD` reads the activity log for that day and shows each student's daily equivalent score by primary field. For example, an attendance record of `+2` with `attendance.max_score=8` is shown as `25` because `2 / 8 * 100 = 25`.
 
 Field schema can be checked against the in-memory cache and the JSON score file:
 ```shell
