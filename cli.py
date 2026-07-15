@@ -7,7 +7,7 @@ from colorama import Fore, Style, init
 from prettytable import PrettyTable
 
 from manager import StudentManager
-from objs import Student, Course, LabStudent
+from objs import Student, Course, LabStudent, LAB_MANAGED_FIELDS
 
 init(autoreset=True)
 
@@ -32,6 +32,17 @@ Find lab students by name fragment and show lab No., name, and ID.""",
 Show top or bottom lab students. Default ranks by weighted lab total. Use -t <exp_no> for one experiment.""",
     "log": """lab log
 Show the last 20 lab activity logs.""",
+    "schema": """lab schema
+Show or configure lab score schema.
+Usage:
+  lab schema
+  lab schema mode exam|usual|split
+  lab schema map <exp_no1,exp_no2,...> usual|exam
+Modes:
+  exam: one lab field contributes to course exam.
+  usual: one lab field contributes to course usual.
+  split: lab_usual contributes to usual and lab_exam contributes to exam.
+Use change field lab/lab_usual/lab_exam -w <weight> to set course mix weights.""",
     "help": """lab help [command]
 Show help for all lab commands, or detailed help for one lab command.""",
 }
@@ -152,7 +163,7 @@ class StudentManagerCIL(cmd.Cmd):
         return field_modes.get(field, global_mode or self.manager.course.default_display_mode(field))
 
     def _field_header(self, field, mode):
-        return f"{field}{self.manager.course.display_mode_suffix(mode)}"
+        return f"{self.manager.course.display_field_name(field)}{self.manager.course.display_mode_suffix(mode)}"
 
     def _color(self, text, color_name, bright=False):
         color = getattr(Fore, color_name, "")
@@ -204,8 +215,19 @@ class StudentManagerCIL(cmd.Cmd):
         mode = self.manager.course._normalize_mode(self._schema_config_value(config, "mode", "points"))
         max_score = self._schema_format_number(self._schema_config_value(config, "max_score"))
         weight = self._schema_format_number(self._schema_config_value(config, "weight"))
-        label = self._color(f"{name}({alias})", color_name, bright=True)
+        display_name = self.manager.course.display_field_name(name)
+        label = self._color(f"{display_name}({alias})", color_name, bright=True)
         print(f"{indent}- {label}: weight={weight}, max={max_score}, mode={mode}")
+
+    def _schema_weight_display(self, value, warn_over=100):
+        text = self._schema_format_number(value)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return text
+        if numeric > warn_over:
+            return self._color(text, "RED", bright=True)
+        return text
 
     def _print_schema_tree(self, schema, source, path=None):
         color_name = "CYAN" if source == "cache" else "MAGENTA"
@@ -217,18 +239,27 @@ class StudentManagerCIL(cmd.Cmd):
         primary_configs = self._schema_primary_configs(schema)
         usual_fields = [c for c in primary_configs if self._schema_config_value(c, "group") == "usual"]
         exam_fields = [c for c in primary_configs if self._schema_config_value(c, "group") == "exam"]
-        usual_weight = sum(float(self._schema_config_value(c, "weight", 0) or 0) for c in usual_fields)
-        total_weight = sum(float(self._schema_config_value(c, "weight", 0) or 0) for c in primary_configs)
+        usual_weight = sum(
+            float(self._schema_config_value(c, "weight", 0) or 0)
+            for c in usual_fields
+        )
+        total_weight = sum(
+            float(self._schema_config_value(c, "weight", 0) or 0)
+            for c in primary_configs
+        )
         usual_alias = self._schema_find_alias(schema, "usual", "u")
         total_alias = self._schema_find_alias(schema, "total", "t")
 
-        print(f"{self._color(f'total({total_alias})', color_name, bright=True)} weight={self._schema_format_number(total_weight)}")
-        print(f"  {self._color(f'usual({usual_alias})', color_name, bright=True)} weight={self._schema_format_number(usual_weight)}")
+        print(f"{self._color(f'total({total_alias})', color_name, bright=True)} course_weight={self._schema_weight_display(total_weight)}")
+        print(f"  {self._color(f'usual({usual_alias})', color_name, bright=True)} course_weight={self._schema_weight_display(usual_weight)}")
         for config in usual_fields:
             self._print_schema_primary(config, "    ", color_name)
 
-        exam_weight = sum(float(self._schema_config_value(c, "weight", 0) or 0) for c in exam_fields)
-        print(f"  {self._color('exam', color_name, bright=True)} weight={self._schema_format_number(exam_weight)}")
+        exam_weight = sum(
+            float(self._schema_config_value(c, "weight", 0) or 0)
+            for c in exam_fields
+        )
+        print(f"  {self._color('exam', color_name, bright=True)} course_weight={self._schema_weight_display(exam_weight)}")
         for config in exam_fields:
             self._print_schema_primary(config, "    ", color_name)
 
@@ -301,9 +332,40 @@ class StudentManagerCIL(cmd.Cmd):
         for help_text in LAB_HELP.values():
             print(help_text)
             print()
+
+    def show_lab_schema(self):
+        schema = self.manager.lab_course.schema
+        mode = schema.get("mode", "exam")
+        def course_weight(field_name):
+            config = self.manager.course.primary_fields.get(field_name)
+            if not config:
+                return "-"
+            return self._schema_format_number(config.get("weight", 0))
+
+        print(self._color("LAB schema", "CYAN", bright=True))
+        print(f"mode={mode}")
+        if mode == "split":
+            print(f"  lab_usual -> course usual, course field weight={course_weight('lab_usual')}")
+            print(f"  lab_exam  -> course exam,  course field weight={course_weight('lab_exam')}")
+        elif mode == "usual":
+            print(f"  lab -> course usual, course field weight={course_weight('lab')}")
+        else:
+            print(f"  lab -> course exam, course field weight={course_weight('lab')}")
+        print("course mix weights are configured by change field ... -w")
+
+        print("experiments:")
+        if not self.manager.lab_course.experiments:
+            print("  (none)")
+            return
+        for exp_no, exp in self.manager.lab_course.experiments.items():
+            group = self.manager.lab_course.experiment_group(exp_no)
+            print(f"  - {exp_no}:{exp.name}, weight={exp.weight:g}, group={group}")
     
     def show_students(self, students, global_mode=None, field_modes=None, show_extra=False):
         if isinstance(students, Iterable):
+            if self.manager.course.has_lab_fields():
+                self.show_students_with_lab_breakdown(students, global_mode, field_modes, show_extra)
+                return
             tab = PrettyTable()
             tab.border = True
             fields = self.manager.course.all_display_field_names()
@@ -325,6 +387,9 @@ class StudentManagerCIL(cmd.Cmd):
                 tab.add_row(row)
             print(tab)
         elif isinstance(students, Student):
+            if self.manager.course.has_lab_fields():
+                self.show_students_with_lab_breakdown([students], global_mode, field_modes, show_extra)
+                return
             print_score = f"{students.N}-{students.name}({students.id}): "
             for field in self.manager.course.all_display_field_names():
                 mode = self._resolve_display_mode(field, global_mode, field_modes)
@@ -335,6 +400,55 @@ class StudentManagerCIL(cmd.Cmd):
             print(print_score)
         else:
             return 2, f"Unknown Student {students}"
+
+    def _student_lab_breakdown_row(self, student, theory_fields, has_usual_lab, has_exam_lab, global_mode=None, field_modes=None, show_extra=False):
+        row = [student.N, student.name, student.id]
+        for field in theory_fields:
+            mode = self._resolve_display_mode(field, global_mode, field_modes)
+            score = self.manager.course.display_field_score(student, field, mode)
+            extra = self.manager.course.display_field_extra(student, field, mode) if show_extra else 0
+            row.append(self._format_score_with_extra(score, extra, mode) if show_extra else self._format_score(score))
+
+        row.append(self._format_score(self.manager.course.theory_group_percent(student, "usual")))
+        if has_usual_lab:
+            row.append(self._format_score(self.manager.course.lab_group_percent(student, "usual")))
+            row.append(self._format_score(self.manager.course.calculate_field_score(student, "usual")))
+
+        row.append(self._format_score(self.manager.course.theory_group_percent(student, "exam")))
+        if has_exam_lab:
+            row.append(self._format_score(self.manager.course.lab_group_percent(student, "exam")))
+            row.append(self._format_score(self.manager.course.display_field_score(student, "exam", "percent")))
+        row.append(self._format_score(self.manager.course.calculate_field_score(student, "total")))
+        return row
+
+    def show_students_with_lab_breakdown(self, students, global_mode=None, field_modes=None, show_extra=False):
+        if isinstance(students, Student):
+            students = [students]
+        theory_fields = [
+            field for field, config in self.manager.course.primary_fields.items()
+            if field not in LAB_MANAGED_FIELDS and config.get("group") != "exam"
+        ]
+        has_usual_lab = self.manager.course.has_lab_group("usual")
+        has_exam_lab = self.manager.course.has_lab_group("exam")
+        headers = ['No.', 'Name', 'ID']
+        headers.extend([
+            self._field_header(field, self._resolve_display_mode(field, global_mode, field_modes))
+            for field in theory_fields
+        ])
+        headers.append('t-usual(%)')
+        if has_usual_lab:
+            headers.extend(['l-usual(%)', 'usual(%)'])
+        headers.append('t-exam(%)')
+        if has_exam_lab:
+            headers.extend(['l-exam(%)', 'exam(%)'])
+        headers.append('total(pt)')
+
+        tab = PrettyTable()
+        tab.border = True
+        tab.field_names = headers
+        for student in students:
+            tab.add_row(self._student_lab_breakdown_row(student, theory_fields, has_usual_lab, has_exam_lab, global_mode, field_modes, show_extra))
+        print(tab)
 
     def _score_as_field_percent(self, field, score):
         field = self.manager.course.normalize_field_name(field)
@@ -446,14 +560,16 @@ class StudentManagerCIL(cmd.Cmd):
             tab.field_names = (
                 ['Lab No.', 'Name', 'ID']
                 + [f"{e.exp_no}:{e.name}({e.weight:g})" for e in experiments]
-                + ['Lab Total']
+                + ['Lab Usual', 'Lab Exam', 'Lab Total']
             )
             for s in students:
                 row = [s.N, s.name, s.id]
                 for e in experiments:
                     record = s.lab_scores.get(e.exp_no)
                     row.append(record[1] if record else '')
-                row.append(round(s.calculate_lab_score(self.manager.lab_course.experiments), 2))
+                row.append(round(self.manager.lab_course.calculate_schema_score(s, "usual"), 2))
+                row.append(round(self.manager.lab_course.calculate_schema_score(s, "exam"), 2))
+                row.append(round(self.manager.lab_course.calculate_schema_score(s), 2))
                 tab.add_row(row)
             print(tab)
         elif isinstance(students, LabStudent):
@@ -557,6 +673,9 @@ class StudentManagerCIL(cmd.Cmd):
         if field_name not in self.manager.course.primary_fields:
             print_info(2, f"Field must be one of {self.manager.course.all_primary_field_names()}")
             return
+        if field_name in self.manager.course.external_score_providers:
+            print_info(2, f"{field_name} is computed from lab records. Use lab rd/brd instead.")
+            return
         else:
             s = self.manager.course.find_students_by_nos(int(args[0]))
             if not s:
@@ -585,6 +704,9 @@ class StudentManagerCIL(cmd.Cmd):
         field_name = self.manager.course.normalize_field_name(args[1])
         if field_name not in self.manager.course.primary_fields:
             print(f"Field must be one of {self.manager.course.all_primary_field_names()}")
+            return
+        if field_name in self.manager.course.external_score_providers:
+            print_info(2, f"{field_name} is computed from lab records. Use lab rd/brd instead.")
             return
         else:
             students = self.manager.course.find_students_by_nos([int(n) for n in args[0].split(',')])
@@ -879,6 +1001,12 @@ class StudentManagerCIL(cmd.Cmd):
                 return
             idx += 2
 
+        normalized_field_name = self.manager.course.normalize_field_name(field_name)
+        if normalized_field_name in LAB_MANAGED_FIELDS:
+            if weight is None or new_name or max_score is not None or mode is not None or fields is not None or alias_changed:
+                print_info(2, "Lab computed fields can only change course mix weight. Use: change field <lab|lab_usual|lab_exam> -w <weight>")
+                return
+
         self.manager.push_undo(f"change field {field_name}")
         f, msg = self.manager.course.change_field(
             field_name,
@@ -911,6 +1039,7 @@ class StudentManagerCIL(cmd.Cmd):
             lab find <name_fragment>
             lab tops [-n N] [-t total|t|<exp_no>]
             lab log
+            lab schema [mode|map]
             lab help [command]
         '''
         if not self._lab_enabled():
@@ -918,7 +1047,7 @@ class StudentManagerCIL(cmd.Cmd):
 
         parts = args.split()
         if not parts:
-            print_info(1, "Usage: lab import/add-exp/add/rm/rd/brd/show/find/tops/log/help ...")
+            print_info(1, "Usage: lab import/add-exp/add/rm/rd/brd/show/find/tops/log/schema/help ...")
             return
 
         cmd = parts[0]
@@ -927,6 +1056,43 @@ class StudentManagerCIL(cmd.Cmd):
                 print_info(2, "Usage: lab help [command]")
                 return
             self.show_lab_help(parts[1] if len(parts) == 2 else None)
+            return
+
+        if cmd == "schema":
+            if len(parts) == 1:
+                self.show_lab_schema()
+                return
+            if parts[1] == "mode":
+                if len(parts) != 3:
+                    print_info(2, "Usage: lab schema mode exam|usual|split")
+                    return
+                self.manager.push_undo(f"lab schema mode {parts[2]}", scope="lab")
+                f, msg = self.manager.lab_course.set_schema_mode(parts[2])
+                if not f:
+                    self.manager.sync_lab_schema()
+                    self.manager.lab_logger.add(f"Changed lab schema mode to {parts[2]}")
+                else:
+                    self.manager.rollback_undo()
+                print_info(f, msg)
+                return
+            if parts[1] in ["map", "group"]:
+                if len(parts) != 4:
+                    print_info(2, "Usage: lab schema map <exp_no1,exp_no2,...> usual|exam")
+                    return
+                exp_nos = [exp_no for exp_no in parts[2].split(',') if exp_no]
+                self.manager.push_undo(f"lab schema map {parts[2]} {parts[3]}", scope="lab")
+                f, msg = self.manager.lab_course.set_experiment_group(exp_nos, parts[3])
+                if not f:
+                    self.manager.sync_lab_schema()
+                    self.manager.lab_logger.add(f"Changed lab schema experiment group: {parts[2]} -> {parts[3]}")
+                else:
+                    self.manager.rollback_undo()
+                print_info(f, msg)
+                return
+            if parts[1] == "weight":
+                print_info(2, "Lab schema no longer stores course mix weights. Use: change field <lab|lab_usual|lab_exam> -w <weight>")
+                return
+            print_info(2, "Usage: lab schema [mode|map]")
             return
 
         if cmd == "import":
@@ -956,6 +1122,7 @@ class StudentManagerCIL(cmd.Cmd):
             self.manager.push_undo(f"lab add experiment {exp_no}-{name}", scope="lab")
             f, msg = self.manager.lab_course.add_experiment(exp_no, name, weight)
             if not f:
+                self.manager.sync_lab_schema()
                 self.manager.lab_logger.add(f"Added lab experiment {exp_no}-{name}({self.manager.lab_course.experiments[exp_no].weight:g})")
             else:
                 self.manager.rollback_undo()
@@ -967,6 +1134,7 @@ class StudentManagerCIL(cmd.Cmd):
                 self.manager.push_undo(f"lab add {parts[1]}[{parts[2]}]", scope="lab")
                 f, msg = self.manager.lab_course.add_student(LabStudent(parts[2], parts[1]))
                 if not f:
+                    self.manager.sync_lab_schema()
                     self.manager.lab_logger.add(f"Added lab student {parts[1]}[{parts[2]}]")
                 else:
                     self.manager.rollback_undo()
@@ -980,6 +1148,7 @@ class StudentManagerCIL(cmd.Cmd):
                 self.manager.push_undo(f"lab add {parts[1]}[{parts[2]}] with No.={ns}", scope="lab")
                 f, msg = self.manager.lab_course.add_student(LabStudent(parts[2], parts[1]), with_no=True, no=int(ns))
                 if not f:
+                    self.manager.sync_lab_schema()
                     self.manager.lab_logger.add(f"Added lab student {parts[1]}[{parts[2]}] with No.={ns}")
                 else:
                     self.manager.rollback_undo()
@@ -1005,6 +1174,7 @@ class StudentManagerCIL(cmd.Cmd):
                 self.manager.push_undo(f"lab remove {student.N}-{student.name}[{student.id}]", scope="lab")
                 f, msg = self.manager.lab_course.remove_student(student)
                 if not f:
+                    self.manager.sync_lab_schema()
                     self.manager.lab_logger.add(f"Removed lab student {student.name}[{student.id}].")
                 else:
                     self.manager.rollback_undo()
@@ -1022,6 +1192,7 @@ class StudentManagerCIL(cmd.Cmd):
             self.manager.push_undo(f"lab record {parts[2]}={parts[3]} for {student.N}-{student.name}[{student.id}]", scope="lab")
             f, msg = self.manager.lab_course.record_score(student, parts[2], parts[3])
             if not f:
+                self.manager.sync_lab_schema()
                 self.manager.lab_logger.add(f"Lab record: {student.N}-{student.name}[{student.id}]: {parts[2]}={parts[3]}")
                 score = self._format_score(parts[3])
                 print(f"{student.name}[{student.id}] {self._lab_label(parts[2])} " + Fore.GREEN + Style.BRIGHT + f"+{score}" + Style.RESET_ALL + "!")
@@ -1039,6 +1210,7 @@ class StudentManagerCIL(cmd.Cmd):
             self.manager.push_undo(f"lab batch record {parts[2]}={parts[3]}", scope="lab")
             f, msg = self.manager.lab_course.record_scores(students, parts[2], parts[3], exclusion)
             if not f:
+                self.manager.sync_lab_schema()
                 self.manager.lab_logger.add(f"Lab batch record: {parts[2]}={parts[3]} for students{' excluding:' if exclusion else ':'} {[s.name for s in students]}")
             else:
                 self.manager.rollback_undo()
@@ -1065,7 +1237,7 @@ class StudentManagerCIL(cmd.Cmd):
             if rank_by in ["t", "total"]:
                 title = "Ranked by lab total score"
                 ranked = [
-                    (s, round(s.calculate_lab_score(self.manager.lab_course.experiments), 2))
+                    (s, round(self.manager.lab_course.calculate_schema_score(s), 2))
                     for s in self.manager.lab_course.students.values()
                 ]
             elif rank_by in self.manager.lab_course.experiments:

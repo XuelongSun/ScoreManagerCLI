@@ -9,6 +9,17 @@ DEFAULT_PRIMARY_FIELDS = [
     {"name": "exam", "alias": "e", "max_score": 100, "mode": "percent", "weight": 60, "group": "exam"},
 ]
 
+LAB_MANAGED_FIELDS = {
+    "lab": {"name": "lab", "alias": "l", "max_score": 100, "mode": "percent", "weight": 0, "group": "lab"},
+    "lab_usual": {"name": "lab_usual", "alias": "lu", "max_score": 100, "mode": "percent", "weight": 0, "group": "usual"},
+    "lab_exam": {"name": "lab_exam", "alias": "le", "max_score": 100, "mode": "percent", "weight": 0, "group": "exam"},
+}
+
+DEFAULT_LAB_SCHEMA = {
+    "mode": "exam",
+    "experiment_groups": {},
+}
+
 DEFAULT_SECONDARY_FIELDS = [
     {"name": "usual", "alias": "u", "group": "usual"},
     {"name": "total", "alias": "t", "group": "total"},
@@ -102,6 +113,10 @@ class LabCourse:
         self.name = name
         self.students:Dict[str, LabStudent] = {}
         self.experiments:Dict[str, LabExperiment] = {}
+        self.schema = {
+            "mode": DEFAULT_LAB_SCHEMA["mode"],
+            "experiment_groups": DEFAULT_LAB_SCHEMA["experiment_groups"].copy(),
+        }
 
     def add_student(self, student:LabStudent, with_no=False, no=0):
         if student.id in self.students:
@@ -209,6 +224,64 @@ class LabCourse:
                 return f, msg
         return 0, f"Batch recorded {len(target_students)} students' lab experiment {exp_no}"
 
+    def has_data(self):
+        return bool(self.students or self.experiments)
+
+    def load_schema(self, schema):
+        schema = schema or {}
+        mode = schema.get("mode", DEFAULT_LAB_SCHEMA["mode"])
+        if mode == "total":
+            mode = "exam"
+        if mode not in ["exam", "usual", "split"]:
+            mode = DEFAULT_LAB_SCHEMA["mode"]
+        self.schema = {
+            "mode": mode,
+            "experiment_groups": {
+                str(exp_no): group
+                for exp_no, group in schema.get("experiment_groups", {}).items()
+                if group in ["usual", "exam"]
+            },
+        }
+
+    def export_schema(self):
+        return {
+            "mode": self.schema["mode"],
+            "experiment_groups": self.schema["experiment_groups"].copy(),
+        }
+
+    def set_schema_mode(self, mode):
+        if mode == "total":
+            return 2, "Lab schema mode total was replaced by exam. Use: lab schema mode exam"
+        if mode not in ["exam", "usual", "split"]:
+            return 2, "Lab schema mode must be exam, usual, or split"
+        self.schema["mode"] = mode
+        return 0, f"Lab schema mode changed to {mode}"
+
+    def set_experiment_group(self, exp_nos, group):
+        if group not in ["usual", "exam"]:
+            return 2, "Lab experiment group must be usual or exam"
+        unknown = [str(exp_no) for exp_no in exp_nos if str(exp_no) not in self.experiments]
+        if unknown:
+            return 2, f"Lab experiment not found: {unknown}"
+        for exp_no in exp_nos:
+            self.schema["experiment_groups"][str(exp_no)] = group
+        return 0, f"Lab experiments {list(exp_nos)} set to {group}"
+
+    def experiment_group(self, exp_no):
+        return self.schema["experiment_groups"].get(str(exp_no), "exam")
+
+    def calculate_schema_score(self, student, group=None):
+        selected = []
+        for exp_no, exp in self.experiments.items():
+            if group and self.experiment_group(exp_no) != group:
+                continue
+            score = student.lab_scores.get(exp_no, [None, 0])[1]
+            selected.append((exp_no, exp, score))
+        total_weight = sum(exp.weight for _, exp, _ in selected)
+        if total_weight == 0:
+            return 0
+        return sum(score * exp.weight for _, exp, score in selected) / total_weight
+
 
 class Course:
     def __init__(self, name="course1") -> None:
@@ -217,7 +290,14 @@ class Course:
         self.primary_fields = {}
         self.secondary_fields = {}
         self.field_aliases = {}
+        self.external_score_providers = {}
+        self.lab_composite_fields = {}
         self._init_default_fields()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["external_score_providers"] = {}
+        return state
 
     def _init_default_fields(self):
         for config in DEFAULT_PRIMARY_FIELDS:
@@ -236,6 +316,9 @@ class Course:
 
     def normalize_field_name(self, field_name):
         return self.field_aliases.get(field_name, field_name)
+
+    def display_field_name(self, field_name):
+        return self.normalize_field_name(field_name)
 
     def all_primary_field_names(self):
         return list(self.primary_fields.keys())
@@ -265,7 +348,7 @@ class Course:
             "max_score": config.get("max_score", config.get("max-score", 100)),
             "mode": config.get("mode", "direct"),
             "weight": config.get("weight"),
-            "group": config.get("group", "exam" if name == "exam" else "usual"),
+            "group": config.get("group", "exam" if name == "exam" else "lab" if name == "lab" else "usual"),
             "fields": config.get("fields", []),
         }
 
@@ -304,8 +387,8 @@ class Course:
                 weight = weight
             if weight < 0:
                 return None, "Weight must not be negative"
-        if group not in ["usual", "exam"]:
-            return None, "Group must be usual or exam"
+        if group not in ["usual", "exam", "lab"]:
+            return None, "Group must be usual, exam, or lab"
         return {
             "name": name,
             "alias": alias,
@@ -333,6 +416,86 @@ class Course:
 
     def add_secondary_field(self, name, max_score, mode, weight=None, fields=None, alias=None, initializing=False):
         return 2, "Secondary fields are fixed: usual and total"
+
+    def ensure_lab_field(self, field_name="lab", group=None, weight=None):
+        config = LAB_MANAGED_FIELDS[field_name].copy()
+        if group:
+            config["group"] = group
+        if weight is not None:
+            config["weight"] = weight
+        if field_name in self.primary_fields:
+            update = {
+                "max_score": config["max_score"],
+                "mode": config["mode"],
+                "group": config["group"],
+                "fields": config.get("fields", []),
+            }
+            if weight is not None:
+                update["weight"] = float(config["weight"])
+            self.primary_fields[field_name].update(update)
+            return
+        alias = config["alias"]
+        if alias in self.field_aliases:
+            alias = None
+        self.add_primary_field(
+            config["name"],
+            config["max_score"],
+            config["mode"],
+            config["weight"],
+            alias=alias,
+            group=config["group"],
+            initializing=True,
+        )
+
+    def use_theory_exam_field(self, enabled):
+        if enabled:
+            if "theory" in self.primary_fields and "theory_exam" not in self.primary_fields:
+                self.change_field("theory", new_name="theory_exam")
+            if "exam" in self.primary_fields and "theory_exam" not in self.primary_fields:
+                self.change_field("exam", new_name="theory_exam")
+            if "theory_exam" in self.primary_fields:
+                self.primary_fields["theory_exam"]["group"] = "exam"
+                self.primary_fields["theory_exam"]["alias"] = "e"
+                self.field_aliases["e"] = "theory_exam"
+                self.field_aliases["theory"] = "theory_exam"
+            return
+
+        if "theory_exam" in self.primary_fields and "exam" not in self.primary_fields:
+            self.change_field("theory_exam", new_name="exam")
+        if "theory" in self.primary_fields and "exam" not in self.primary_fields:
+            self.change_field("theory", new_name="exam")
+        if "exam" in self.primary_fields:
+            self.primary_fields["exam"]["group"] = "exam"
+            self.primary_fields["exam"]["alias"] = "e"
+            self.field_aliases["e"] = "exam"
+            if self.field_aliases.get("theory") == "theory_exam":
+                self.field_aliases.pop("theory")
+
+    def remove_primary_field(self, field_name):
+        field_name = self.normalize_field_name(field_name)
+        if field_name not in self.primary_fields:
+            return
+        config = self.primary_fields.pop(field_name)
+        alias = config.get("alias")
+        if alias in self.field_aliases:
+            self.field_aliases.pop(alias)
+        self.external_score_providers.pop(field_name, None)
+        for student in self.students.values():
+            if field_name in student.scores:
+                student.scores.pop(field_name)
+            if hasattr(student, field_name):
+                delattr(student, field_name)
+
+    def set_external_score_provider(self, field_name, provider):
+        field_name = self.normalize_field_name(field_name)
+        self.external_score_providers[field_name] = provider
+
+    def set_lab_composite_fields(self, mapping=None):
+        self.lab_composite_fields = mapping or {}
+
+    def is_lab_managed_field(self, field_name):
+        field_name = self.normalize_field_name(field_name)
+        return field_name in LAB_MANAGED_FIELDS
 
     def _find_field_level(self, name):
         name = self.normalize_field_name(name)
@@ -480,12 +643,12 @@ class Course:
         if field_name not in self.secondary_fields:
             return 0
         if field_name == "usual":
-            usual_weight = self._group_weight("usual")
-            if usual_weight == 0:
-                return 0
-            return self._group_contribution(student, "usual") / usual_weight * 100
+            return self._composite_group_percent(student, "usual")
         if field_name == "total":
-            return self._group_contribution(student, "usual") + self._group_contribution(student, "exam")
+            return (
+                self._composite_group_percent(student, "usual") * self._course_group_weight("usual") / 100
+                + self._composite_group_percent(student, "exam") * self._course_group_weight("exam") / 100
+            )
         return 0
 
     def calculate_field_score(self, student, field_name):
@@ -511,11 +674,18 @@ class Course:
             config = self.primary_fields[field_name]
             if mode == "percent":
                 return self._field_percent_score(student, config)
+            if config["mode"] == "points":
+                return self._field_display_score(student, config)
             return self._field_contribution(student, config)
         if field_name == "usual":
             if mode == "percent":
                 return self.calculate_secondary_score(student, "usual")
-            return self._group_contribution(student, "usual")
+            return self.calculate_secondary_score(student, "usual") * self._course_group_weight("usual") / 100
+        if field_name == "exam":
+            exam_percent = self._composite_group_percent(student, "exam")
+            if mode == "percent":
+                return exam_percent
+            return exam_percent * self._course_group_weight("exam") / 100
         if field_name == "total":
             return self.calculate_secondary_score(student, "total")
         return 0
@@ -527,6 +697,21 @@ class Course:
             return self._field_extra_display(student, self.primary_fields[field_name], mode)
         return 0
 
+    def has_lab_fields(self):
+        return any(field_name in self.primary_fields for field_name in LAB_MANAGED_FIELDS)
+
+    def theory_group_percent(self, student, group):
+        return self._theory_group_percent(student, group)
+
+    def lab_group_percent(self, student, group):
+        lab_field = self.lab_composite_fields.get(group)
+        if not lab_field:
+            return 0
+        return self.display_field_score(student, lab_field, "percent")
+
+    def has_lab_group(self, group):
+        return group in self.lab_composite_fields
+
     def display_record_score(self, field_name, score, mode=None):
         field_name = self.normalize_field_name(field_name)
         if field_name not in self.primary_fields:
@@ -535,14 +720,15 @@ class Course:
         mode = self.normalize_display_mode(mode) if mode else config["mode"]
         score = float(score)
         if mode == "percent":
-            if config["mode"] == "percent":
-                return score / config["max_score"] * 100 if config["max_score"] else 0
-            return score / config["weight"] * 100 if config["weight"] else 0
+            return score / config["max_score"] * 100 if config["max_score"] else 0
         if config["mode"] == "percent":
             return score / config["max_score"] * config["weight"] if config["max_score"] else 0
         return score
 
     def _field_raw_score(self, student, config):
+        provider = self.external_score_providers.get(config["name"])
+        if provider:
+            return provider(student)
         student.ensure_score_field(config["name"])
         records = student.scores[config["name"]]
         if not records:
@@ -559,37 +745,61 @@ class Course:
 
     def _field_percent_score(self, student, config):
         score = self._field_display_score(student, config)
-        if config["mode"] == "percent":
-            return score / config["max_score"] * 100 if config["max_score"] else 0
-        if config["weight"]:
-            return self._field_contribution(student, config) / config["weight"] * 100
-        return 0
+        return score / config["max_score"] * 100 if config["max_score"] else 0
 
     def _field_extra_display(self, student, config, mode):
-        extra_points = self._field_extra_contribution(student, config)
-        if extra_points <= 0:
+        extra_raw = self._field_extra_raw(student, config)
+        if extra_raw <= 0:
             return 0
         if mode == "percent":
-            return extra_points / config["weight"] * 100 if config["weight"] else 0
-        return extra_points
+            return extra_raw / config["max_score"] * 100 if config["max_score"] else 0
+        if config["mode"] == "points":
+            return extra_raw
+        return extra_raw / config["max_score"] * config["weight"] if config["max_score"] else 0
 
     def _field_contribution(self, student, config):
         raw_score = self._field_raw_score(student, config)
-        if config["mode"] == "points":
-            return min(raw_score, config["max_score"], config["weight"])
         if config["max_score"] == 0:
             return 0
         return min(raw_score, config["max_score"]) / config["max_score"] * config["weight"]
 
-    def _field_extra_contribution(self, student, config):
+    def _field_extra_raw(self, student, config):
         raw_score = self._field_raw_score(student, config)
-        if config["mode"] == "points":
-            cap = min(config["max_score"], config["weight"])
-            return max(raw_score - cap, 0)
+        return max(raw_score - config["max_score"], 0)
+
+    def _field_extra_contribution(self, student, config):
         if config["max_score"] == 0:
             return 0
-        extra_raw = max(raw_score - config["max_score"], 0)
-        return extra_raw / config["max_score"] * config["weight"]
+        return self._field_extra_raw(student, config) / config["max_score"] * config["weight"]
+
+    def _theory_group_weight(self, group):
+        return sum(
+            config["weight"]
+            for config in self.primary_fields.values()
+            if config.get("group") == group and config["name"] not in LAB_MANAGED_FIELDS
+        )
+
+    def _course_group_weight(self, group):
+        return self._group_weight(group)
+
+    def _theory_group_contribution(self, student, group):
+        return sum(
+            self._field_contribution(student, config)
+            for config in self.primary_fields.values()
+            if config.get("group") == group and config["name"] not in LAB_MANAGED_FIELDS
+        )
+
+    def _theory_group_percent(self, student, group):
+        weight = self._theory_group_weight(group)
+        if weight == 0:
+            return 0
+        return self._theory_group_contribution(student, group) / weight * 100
+
+    def _composite_group_percent(self, student, group):
+        group_weight = self._group_weight(group)
+        if group_weight == 0:
+            return 0
+        return self._group_contribution(student, group) / group_weight * 100
 
     def _group_weight(self, group):
         return sum(config["weight"] for config in self.primary_fields.values() if config.get("group") == group)

@@ -3,7 +3,7 @@ import csv
 import copy
 import os
 import pandas as pd
-from objs import Student, Course, Logger, SCORE_TYPE, LabStudent, LabCourse
+from objs import Student, Course, Logger, SCORE_TYPE, LabStudent, LabCourse, LAB_MANAGED_FIELDS
 import json
 import warnings
 
@@ -18,6 +18,48 @@ class StudentManager:
         self.working_dir = working_dir or ''
         self.undo_stack = []
         self.load_data()
+
+    def sync_lab_schema(self):
+        managed_fields = set(LAB_MANAGED_FIELDS.keys())
+        if not (self.lab_course.has_data() or managed_fields.intersection(self.course.primary_fields)):
+            return
+
+        mode = self.lab_course.schema.get("mode", "exam")
+        if mode == "total":
+            mode = "exam"
+        if mode == "split":
+            active_fields = {"lab_usual", "lab_exam"}
+        else:
+            active_fields = {"lab"}
+
+        for field_name in managed_fields - active_fields:
+            self.course.remove_primary_field(field_name)
+
+        self.course.set_lab_composite_fields({})
+        if mode == "split":
+            self.course.use_theory_exam_field(True)
+            self.course.ensure_lab_field("lab_usual", group="usual")
+            self.course.ensure_lab_field("lab_exam", group="exam")
+            self.course.set_external_score_provider("lab_usual", lambda student: self.lab_score_for_theory_student(student, "usual"))
+            self.course.set_external_score_provider("lab_exam", lambda student: self.lab_score_for_theory_student(student, "exam"))
+            self.course.set_lab_composite_fields({"usual": "lab_usual", "exam": "lab_exam"})
+        else:
+            if mode == "usual":
+                self.course.use_theory_exam_field(False)
+                self.course.ensure_lab_field("lab", group="usual")
+                self.course.set_external_score_provider("lab", lambda student: self.lab_score_for_theory_student(student, None))
+                self.course.set_lab_composite_fields({"usual": "lab"})
+            else:
+                self.course.use_theory_exam_field(True)
+                self.course.ensure_lab_field("lab", group="exam")
+                self.course.set_external_score_provider("lab", lambda student: self.lab_score_for_theory_student(student, None))
+                self.course.set_lab_composite_fields({"exam": "lab"})
+
+    def lab_score_for_theory_student(self, student, group=None):
+        lab_student = self.lab_course.students.get(student.id)
+        if not lab_student:
+            return 0
+        return self.lab_course.calculate_schema_score(lab_student, group)
 
     def theory_score_path(self):
         return os.path.join(self.working_dir, f"{self.course.name}_student_score.json")
@@ -58,6 +100,7 @@ class StudentManager:
         self.working_dir = snapshot["working_dir"]
         Student.N = snapshot["student_next_no"]
         LabStudent.N = snapshot["lab_student_next_no"]
+        self.sync_lab_schema()
 
     def rollback_undo(self):
         if not self.undo_stack:
@@ -112,7 +155,15 @@ class StudentManager:
                         Student.N = max(Student.N, student.N + 1)
                     for s_t in self.course.all_primary_field_names():
                         student.ensure_score_field(s_t)
-                        student.scores[s_t] = data.get(s_t, [])
+                        if s_t == "theory_exam":
+                            student.scores[s_t] = (
+                                data.get("theory_exam")
+                                or data.get("theory")
+                                or data.get("exam")
+                                or []
+                            )
+                        else:
+                            student.scores[s_t] = data.get(s_t, [])
                         setattr(student, s_t, student.scores[s_t])
                     self.add_student(student)
                     if not os.path.exists(lab_file) and data.get('lab'):
@@ -125,6 +176,7 @@ class StudentManager:
         if os.path.exists(lab_file):
             with open(lab_file, 'r', encoding='utf-8') as f:
                 lab_data = json.load(f)
+                self.lab_course.load_schema(lab_data.get('lab_schema', {}))
                 for exp_no, data in lab_data.get('experiments', {}).items():
                     self.lab_course.add_experiment(exp_no, data['name'], data['weight'])
                 for student_id, data in lab_data.get('students', {}).items():
@@ -143,6 +195,7 @@ class StudentManager:
         if os.path.exists(os.path.join(self.working_dir, f"{self.course.name}_lab_activity_log.txt")):
             with open(os.path.join(self.working_dir, f"{self.course.name}_lab_activity_log.txt"), 'r', encoding='utf-8') as f:
                 self.lab_logger.log = f.readlines()
+        self.sync_lab_schema()
         
     def add_student(self, student:Student, log=True, with_no=False, no=0):
         if student.id in self.course.students:
@@ -210,6 +263,7 @@ class StudentManager:
                     reader = csv.DictReader(csvfile)
                     for row in reader:
                         self.lab_course.add_student(LabStudent(row['id'], row['name']))
+                self.sync_lab_schema()
                 self.lab_logger.add(f"Imported {len(self.lab_course.students)} lab students from {filename}.")
                 return True, f"import {len(self.lab_course.students)} lab students from {filename} successfully"
             elif filename.split(".")[-1] == 'xlsx':
@@ -220,6 +274,7 @@ class StudentManager:
                 students_df_d.columns = ['id', 'name']
                 for n, s in students_df_d[5:-1].iterrows():
                     self.lab_course.add_student(LabStudent(s['id'], s['name']))
+                self.sync_lab_schema()
                 self.lab_logger.add(f"Imported {len(self.lab_course.students)} lab students from {filename}.")
                 return True, f"import {len(self.lab_course.students)} lab students from {filename} successfully"
             else:
@@ -228,6 +283,7 @@ class StudentManager:
             return False, f"No Filename Provided!"
 
     def save_data(self):
+        self.sync_lab_schema()
         if self.working_dir and not os.path.exists(self.working_dir):
             os.makedirs(self.working_dir, exist_ok=True)
 
@@ -254,6 +310,7 @@ class StudentManager:
 
         lab_data = {
             'class_name': self.course.name,
+            'lab_schema': self.lab_course.export_schema(),
             'experiments': {},
             'students': {},
         }

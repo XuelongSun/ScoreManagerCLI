@@ -84,3 +84,25 @@ lab find Alice
 lab help rd
 lab show
 ```
+
+`lab show` displays each experiment plus `Lab Usual`, `Lab Exam`, and `Lab Total`.
+
+When lab roster/experiments exist, the theory field schema automatically includes lab-managed fields. Their scores are computed from each matching lab student's weighted lab total, matched by student ID.
+Theory commands cannot record `lab` directly; use `lab rd` or `lab brd`.
+
+Lab scoring can be configured separately:
+```shell
+lab schema
+lab schema mode exam
+lab schema mode usual
+lab schema mode split
+lab schema map exp1,exp2 usual
+lab schema map exp3 exam
+change field lab -w 20
+change field lab_usual -w 10
+change field lab_exam -w 20
+```
+
+Experiment weights from `lab add-exp` are used inside the lab score calculation. Lab field weights are normal child-field weights in the course `field_schema` and changed with `change field ... -w`. In `exam` mode, lab is added under the course exam group. In `usual` mode, lab is added under the course usual group. In `split` mode, `lab_usual` is added under usual and `lab_exam` is added under exam. The course weight of `usual` or `exam` is the sum of all child fields in that group, including lab fields. If the total course weight is greater than 100, schema display highlights it as a warning.
+
+When a course has lab data, theory `show` uses a breakdown view with theory/lab components and the composed `usual` or `exam` score when that group contains lab. The theory-side exam field is named `theory_exam` to distinguish it from `lab_exam`.
